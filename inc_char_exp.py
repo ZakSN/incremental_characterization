@@ -2,6 +2,7 @@ import git
 import os
 import argparse
 import shutil
+import subprocess
 
 class IncrementalCharacterizationExperiment:
 
@@ -31,11 +32,18 @@ class IncrementalCharacterizationExperiment:
         # get a handle for the benchmark repository and collect commits
         self.repo = git.Repo(gitroot)
         self.commits = list(self.repo.iter_commits(self.branch_name))
+        print("Found "+str(len(self.commits))+" commits")
 
     def run_experiment(self):
         self._build_experiment_directory()
 
-        self._build_reference_implementation()
+        current_commit = len(self.commits) - 1
+
+        self._run_vivado_implementation(current_commit)
+        current_commit -= 1
+        self._run_vivado_implementation(current_commit, 'reference.dcp')
+
+        self._run_vivado_implementation(46, 'incremental98.dcp')
 
     def clean_experiment(self):
         '''
@@ -82,7 +90,7 @@ class IncrementalCharacterizationExperiment:
 
         # checkout the commit of interest and get a file list
         self.repo.git.checkout(commit)
-        fileset = self._get_fileset_from_commit(commit.tree)
+        fileset = self._get_fileset_from_commit(commit.tree, fileset=[])
         fileset = [os.path.join(self.gitroot, f) for f in fileset]
 
         # add a constraint file
@@ -99,38 +107,63 @@ class IncrementalCharacterizationExperiment:
         for f in fileset:
             shutil.copy(f, self.srcdir)
 
-    def _build_reference_implementation(self):
+    def _run_vivado_implementation(self, commit_idx, ref_dcp=None):
         '''
-        Build a reference checkpoint
+        Build a checkpoint from the commit_idx. If ref_dcp is not provided build
+        a reference checkpoint, otherwise build an incremental checkpoint based
+        on the reference.
+
         TODO: vivado specific
         '''
         # initialize the project directory with the oldest commit
-        self._init_projdir_from_commit_index(-1)
+        self._init_projdir_from_commit_index(commit_idx)
 
-        # write a tcl script to build a reference implementation
+        # figure out relative paths to required directories
         relative_srcdir = os.path.basename(os.path.normpath(self.srcdir))
         relative_constraint = os.path.join(relative_srcdir, self.constraint_name)
         relative_datadir = os.path.join('..',os.path.basename(os.path.normpath(self.datadir)))
-        outputdir = 'reference'
+        relative_refdcp = 'null'
+
+        add_ref_lines = False
+        add_inc_lines = False
+        if ref_dcp is None:
+            run_type = 'reference'
+            add_ref_lines = True
+        else:
+            run_type = 'incremental'+str(commit_idx)
+            add_inc_lines = True
+            relative_refdcp = os.path.join(relative_datadir, os.path.basename(ref_dcp))
+
         script = [
-            'file mkdir '+outputdir,
-            'create_project -part xcvu3p-ffvc1517-3-e '+outputdir+' '+outputdir,
+            'file mkdir '+run_type,
+            'create_project -part xcvu3p-ffvc1517-3-e '+run_type+' '+run_type,
             'add_files '+relative_srcdir,
             'import_files -fileset constrs_1 -force -norecurse '+relative_constraint,
             'import_files -force',
             'set_property -name {STEPS.SYNTH_DESIGN.ARGS.MORE OPTIONS} -value {'+self.vivado_synth_args+'} -objects [get_runs synth_1]',
+            *([ # build reference implementation
             'set_property AUTO_INCREMENTAL_CHECKPOINT 1 [get_runs impl_1]',
             'set_property AUTO_INCREMENTAL_CHECKPOINT.DIRECTORY . [get_runs impl_1]',
+            ]*add_ref_lines),
+            *([ # build incremental implementation
+            'set_property incremental_checkpoint '+relative_refdcp+' [get_runs impl_1]',
+            ]*add_inc_lines),
             'launch_runs synth_1',
             'wait_on_run synth_1',
             'launch_runs impl_1',
             'wait_on_run impl_1',
             'open_run impl_1',
-            'write_checkpoint '+os.path.join(relative_datadir, 'reference.dcp'),
+            'write_checkpoint '+os.path.join(relative_datadir, run_type+'.dcp'),
+            # reporting
+            'report_timing -file '+os.path.join(relative_datadir, run_type+'_timing.log'),
+            'report_utilization -file '+os.path.join(relative_datadir, run_type+'_util.log'),
+            *([
+            'report_incremental_reuse -file '+os.path.join(relative_datadir, run_type+'_reuse.log'),
+            ]*add_inc_lines),
             'exit',
             ]
-
         self._write_file(script, os.path.join(self.projdir, self.reference_script))
+        subprocess.run(['vivado', '-mode', 'tcl', '-source', self.reference_script], cwd=self.projdir)
 
     def _get_fileset_from_commit(self, root, level=0, fileset=[]):
         '''
