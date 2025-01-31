@@ -16,7 +16,6 @@ class IncrementalCharacterizationExperiment:
         self.gitroot = gitroot
 
         self.branch_name = 'master'
-        self.clk_period = '3'
         self.clk_name = 'clk'
         self.constraint_name = 'clk_constraint.sdc'
         self.vivado_synth_args = '-verilog_define EXT_F_DISABLE -mode out_of_context'
@@ -29,6 +28,8 @@ class IncrementalCharacterizationExperiment:
         self.datadir = os.path.join(self.expdir, 'dcp')
         self.srcdir = os.path.join(self.projdir, 'src')
 
+        self.fmax_search_steps = 2
+
         # get a handle for the benchmark repository and collect commits
         self.repo = git.Repo(gitroot)
         self.commits = list(self.repo.iter_commits(self.branch_name))
@@ -39,11 +40,17 @@ class IncrementalCharacterizationExperiment:
 
         current_commit = len(self.commits) - 1
 
-        self._run_vivado_implementation(current_commit)
+        self._fmax_search('reference', current_commit)
         current_commit -= 1
-        self._run_vivado_implementation(current_commit, 'reference.dcp')
+        self._fmax_search('incremental98', current_commit, 'reference.dcp')
+        current_commit -= 1
+        self._fmax_search('incremental97', current_commit, 'incremental98.dcp')
 
-        self._run_vivado_implementation(46, 'incremental98.dcp')
+        #self._run_vivado_implementation(current_commit)
+        #current_commit -= 1
+        #self._run_vivado_implementation(current_commit, 'reference.dcp')
+
+        #self._run_vivado_implementation(46, 'incremental98.dcp')
 
     def clean_experiment(self):
         '''
@@ -93,50 +100,48 @@ class IncrementalCharacterizationExperiment:
         fileset = self._get_fileset_from_commit(commit.tree, fileset=[])
         fileset = [os.path.join(self.gitroot, f) for f in fileset]
 
-        # add a constraint file
-        constraint = ['create_clock -name '+
-                     self.clk_name+
-                     ' -period '+
-                     self.clk_period+
-                     ' [get_ports '+
-                     self.clk_name+
-                     ']']
-        self._write_file(constraint, os.path.join(self.srcdir, self.constraint_name))
-
         # copy all the files from the commit of interest to the new project dir
         for f in fileset:
             shutil.copy(f, self.srcdir)
 
-    def _run_vivado_implementation(self, commit_idx, ref_dcp=None):
+    def _run_vivado_implementation(self, run_name, commit_idx, clk_period, ref_dcp=None):
         '''
         Build a checkpoint from the commit_idx. If ref_dcp is not provided build
         a reference checkpoint, otherwise build an incremental checkpoint based
-        on the reference.
+        on the reference. Constrain the clk with clk_period.
 
         TODO: vivado specific
         '''
         # initialize the project directory with the oldest commit
         self._init_projdir_from_commit_index(commit_idx)
 
+        # add a constraint file
+        constraint = ['create_clock -name '+
+                     self.clk_name+
+                     ' -period '+
+                     '{:.2f}'.format(clk_period)+
+                     ' [get_ports '+
+                     self.clk_name+
+                     ']']
+        self._write_file(constraint, os.path.join(self.srcdir, self.constraint_name))
+
         # figure out relative paths to required directories
         relative_srcdir = os.path.basename(os.path.normpath(self.srcdir))
         relative_constraint = os.path.join(relative_srcdir, self.constraint_name)
-        relative_datadir = os.path.join('..',os.path.basename(os.path.normpath(self.datadir)))
+        relative_datadir = os.path.join('..',os.path.basename(os.path.normpath(self.datadir)),run_name)
         relative_refdcp = 'null'
 
         add_ref_lines = False
         add_inc_lines = False
         if ref_dcp is None:
-            run_type = 'reference'
             add_ref_lines = True
         else:
-            run_type = 'incremental'+str(commit_idx)
             add_inc_lines = True
             relative_refdcp = os.path.join(relative_datadir, os.path.basename(ref_dcp))
 
         script = [
-            'file mkdir '+run_type,
-            'create_project -part xcvu3p-ffvc1517-3-e '+run_type+' '+run_type,
+            'file mkdir '+run_name,
+            'create_project -part xcvu3p-ffvc1517-3-e '+run_name+' '+run_name,
             'add_files '+relative_srcdir,
             'import_files -fileset constrs_1 -force -norecurse '+relative_constraint,
             'import_files -force',
@@ -153,17 +158,18 @@ class IncrementalCharacterizationExperiment:
             'launch_runs impl_1',
             'wait_on_run impl_1',
             'open_run impl_1',
-            'write_checkpoint '+os.path.join(relative_datadir, run_type+'.dcp'),
+            'write_checkpoint -force '+os.path.join(relative_datadir, run_name+'.dcp'),
             # reporting
-            'report_timing -file '+os.path.join(relative_datadir, run_type+'_timing.log'),
-            'report_utilization -file '+os.path.join(relative_datadir, run_type+'_util.log'),
+            'report_timing -file '+os.path.join(relative_datadir, 'timing.log'),
+            'report_utilization -file '+os.path.join(relative_datadir, 'util.log'),
             *([
-            'report_incremental_reuse -file '+os.path.join(relative_datadir, run_type+'_reuse.log'),
+            'report_incremental_reuse -file '+os.path.join(relative_datadir, 'reuse.log'),
             ]*add_inc_lines),
             'exit',
             ]
         self._write_file(script, os.path.join(self.projdir, self.reference_script))
-        subprocess.run(['vivado', '-mode', 'tcl', '-source', self.reference_script], cwd=self.projdir)
+        subprocess.run(['vivado', '-mode', 'tcl', '-source', self.reference_script], cwd=self.projdir, capture_output=True)
+        shutil.copy(os.path.join(self.projdir, ('vivado.log')), os.path.join(self.datadir, run_name))
 
     def _get_fileset_from_commit(self, root, level=0, fileset=[]):
         '''
@@ -175,6 +181,64 @@ class IncrementalCharacterizationExperiment:
             if entry.type == 'tree':
                 fileset = self._get_fileset_from_commit(entry, level + 1, fileset)
         return fileset
+
+    def _fmax_search(self, run_name, commit_idx, ref_dcp=None):
+        '''
+        Run binary search to find the fmax of the design at the commit_idx, which
+        may optionally be an incremental implementation of the ref_dcp
+        '''
+
+        # run binary search to determine fmax
+        last_guess_too_high = None
+        coef = 0.5
+        guesses = []
+        period_ns = 3
+        for _ in range(self.fmax_search_steps):
+
+            # guess Tmin == period_ns
+            self._run_vivado_implementation(run_name, commit_idx, period_ns, ref_dcp)
+
+            success = self._check_log(os.path.join(self.datadir,run_name,'timing.log'), 'Slack (MET) :')
+
+            if success: # period_ns too high
+                guesses.append(str(period_ns)+' too high')
+                if last_guess_too_high == False:
+                    coef = coef/2
+                period_ns = period_ns*(1-coef)
+                last_guess_too_high = True
+            else: # period_ns too low
+                guesses.append(str(period_ns)+' too low')
+                if last_guess_too_high == True:
+                    coef = coef/2
+                period_ns = period_ns*(1+coef)
+                last_guess_too_high = False
+
+        # we don't want to report area numbers if timing wasn't met. therefore
+        # may need to re-run last 'too high' guess to get a valid area number:
+        if last_guess_too_high == False:
+            for idx in reversed(range(len(guesses))):
+                tmin = float(guesses[idx].split()[0])
+                success = guesses[idx].split()[-1]
+                if success == 'high':
+                    break
+            self._run_vivado_implementation(run_name, commit_idx, tmin, ref_dcp)
+            print('\tPNR: Last guess failed, re-running last successful')
+        else:
+            print('\tPNR: Last guess successful')
+
+        # record the value of Tmin found
+        self._write_file(guesses, os.path.join(self.datadir,run_name, 'tmin.txt'))
+
+    def _check_log(self, logfile, success_msg):
+        '''
+        Check each line of logfile to see if it contains success_msg.
+        '''
+        with open(logfile, 'r') as log:
+            loglines = log.readlines()
+        for line in loglines:
+            if success_msg in line:
+                return True
+        return False
 
 def main():
     parser = argparse.ArgumentParser(
