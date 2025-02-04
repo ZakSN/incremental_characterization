@@ -3,54 +3,41 @@ import os
 import argparse
 import shutil
 import subprocess
+import math
+import time
+import configparser
 
 class IncrementalCharacterizationExperiment:
 
-    def __init__(self, gitroot):
+    def __init__(self, benchmark_desc_file, start_commit=None, stop_commit=None):
         '''
         Initialize an incremental characterization experiment based on the
         benchmark repository located at gitroot.
-
-        TODO: Vivado specific
         '''
-        self.gitroot = gitroot
 
-        self.branch_name = 'master'
-        self.clk_name = 'clk'
-        self.constraint_name = 'clk_constraint.sdc'
-        self.vivado_synth_args = '-verilog_define EXT_F_DISABLE -mode out_of_context'
+        # Read a chronbench benchmark description file
+        benchmark_desc = self._parse_benchmark_desc_file(benchmark_desc_file)
+        self.name = benchmark_desc.sections()[0]
 
-        self.reference_script = 'build_reference_dcp.tcl'
+        # Initialize benchmark settings
+        self.benchmark         = benchmark_desc[self.name]
+        self.branch_name       = self.benchmark['branch']
+        self.clk_name          = self.benchmark['clock']
+        self.vivado_synth_args = self.benchmark['vivado-synth-args']
 
-        self.bmarkname = os.path.basename(os.path.normpath(gitroot))
-        self.expdir = self.bmarkname + '_inc_exp'
-        self.projdir = os.path.join(self.expdir, 'xpr')
-        self.datadir = os.path.join(self.expdir, 'dcp')
-        self.srcdir = os.path.join(self.projdir, 'src')
+        # Assume the benchmark repo is located in the same directory as the desc
+        self.gitroot = benchmark_desc_file.split('.')[0]
 
+        # Set default names for project directories
+        self.expdir = self.name + '_inc_exp'
+        self.srcdir = 'src'
+        self.tmin_file = 'tmin.txt'
+        self.commitdirs = []
+
+        # Experimental settings
         self.fmax_search_steps = 2
-
-        # get a handle for the benchmark repository and collect commits
-        self.repo = git.Repo(gitroot)
-        self.commits = list(self.repo.iter_commits(self.branch_name))
-        print("Found "+str(len(self.commits))+" commits")
-
-    def run_experiment(self):
-        self._build_experiment_directory()
-
-        current_commit = len(self.commits) - 1
-
-        self._fmax_search('reference', current_commit)
-        current_commit -= 1
-        self._fmax_search('incremental98', current_commit, 'reference.dcp')
-        current_commit -= 1
-        self._fmax_search('incremental97', current_commit, 'incremental98.dcp')
-
-        #self._run_vivado_implementation(current_commit)
-        #current_commit -= 1
-        #self._run_vivado_implementation(current_commit, 'reference.dcp')
-
-        #self._run_vivado_implementation(46, 'incremental98.dcp')
+        self.start_commit = start_commit
+        self.stop_commit = stop_commit
 
     def clean_experiment(self):
         '''
@@ -62,114 +49,122 @@ class IncrementalCharacterizationExperiment:
 
         shutil.rmtree(self.expdir)
 
-    def _write_file(self, contents, filename):
+    def run_experiment(self):
         '''
-        Write each string from the list contets to the filename
+        Run an incremental characterization experiment for the current benchmark
         '''
-        with open(filename, 'w') as f:
-            for line in contents:
-                f.write(line+'\n')
+        self._initialize_experiment()
 
-    def _build_experiment_directory(self):
-        '''
-        Set up a directory structure for the incremental characterization experiment
-        '''
-        if not os.path.isdir(self.expdir):
-            os.makedirs(self.expdir)
-            os.makedirs(self.datadir)
-        else:
-            print("QUITTING: "+self.expdir+" already exists!")
+        # The root commit is the oldes commit in the benchmark history
+        root_commit = len(self.commits)-1
+
+        # If start and stop commits were not specified run the experiment across
+        # the entire available design history.
+        if self.stop_commit is None:
+            self.stop_commit = 0
+        if self.start_commit is None:
+            self.start_commit = root_commit
+
+        # check validity of start and stop commits
+        if self.stop_commit > self.start_commit:
+            print("QUITTING: stop_commit should be younger than start_commit")
+            exit()
+        if self.stop_commit < 0:
+            print("QUITTING: stop_commit invalid")
+            exit()
+        if self.start_commit > root_commit:
+            print("QUITTING: start_commit invalid")
             exit()
 
-    def _init_projdir_from_commit_index(self, cidx):
+        # TODO: mechanism to choose other tools
+        tool_fn = self._run_vivado_implementation
+        def compute_extra_args(cidx):
+            if cidx == root_commit:
+                return {'ref_dcp': None}
+            else:
+                prev_commit = os.path.basename(self.commitdirs[cidx+1])
+                prev_dcp = os.path.join(prev_commit,prev_commit+'.dcp')
+                return {'ref_dcp': prev_dcp}
+
+        for cidx in reversed(range(self.stop_commit, self.start_commit+1)):
+            if os.path.isfile(os.path.join(self.commitdirs[cidx],self.tmin_file)):
+                print("Skipping commit "+str(cidx))
+            else:
+                if cidx == root_commit:
+                    print("Building root commit")
+                    self._fmax_search(cidx, tool_fn, compute_extra_args(cidx))
+                else:
+                    if os.path.isfile(os.path.join(self.commitdirs[cidx+1],self.tmin_file)):
+                        print("Building commit: "+str(cidx))
+                        self._fmax_search(cidx, tool_fn, compute_extra_args(cidx))
+                    else:
+                        print("QUITTING: Could not build commit "+str(cidx)+" since ancestor incomplete")
+                        exit()
+
+    def _parse_benchmark_desc_file(self, benchmark_desc_file):
         '''
-        Overwrite the projdir with a the contents of a new commit
+        Read a benchmark description file. Return a populated config object.
+        '''
+        config = configparser.ConfigParser()
+        config.read(benchmark_desc_file)
+        return config
+
+    def _initialize_experiment(self):
+        '''
+        Create an experiment directory if it does not already exist, and
+        create projects for each commit in the benchmark if they do not already
+        exist.
+        '''
+        # Create the experiment directory
+        if not os.path.isdir(self.expdir):
+            os.makedirs(self.expdir)
+        else:
+            print("Found existing "+self.expdir+" experiment directory")
+            print("\tPerhaps you meant to run with `--clean`?")
+
+        # get a handle for the benchmark repository and collect commits
+        self.repo = git.Repo(self.gitroot)
+        self.commits = list(self.repo.iter_commits(self.branch_name))
+        print("Found "+str(len(self.commits))+" commits in "+self.name)
+
+        # create names for each commit level project
+        digits = math.ceil(math.log(len(self.commits), 10))
+        digit_fmt = "{:0"+str(digits)+"d}"
+
+        new_commit_dirs = 0
+        existing_commit_dirs = 0
+        for cidx in range(len(self.commits)):
+            commit_name = digit_fmt.format(cidx)
+            self.commitdirs.append(os.path.join(self.expdir, self.branch_name+'_'+commit_name))
+            this_commitdir = self.commitdirs[-1]
+            if not os.path.isdir(this_commitdir):
+                os.makedirs(this_commitdir)
+                new_commit_dirs += 1
+                self._initialize_commit(cidx, this_commitdir)
+            else:
+                existing_commit_dirs += 1
+
+        print("Found "+str(existing_commit_dirs)+" existing commit directories")
+        print("Initialized "+str(new_commit_dirs)+" new commit directories")
+
+    def _initialize_commit(self, cidx, commitdir):
+        '''
+        Initialize commitdir with the contents of self.commits[cidx]
         '''
         commit = self.commits[cidx]
-
-        # remove the old project directory
-        if os.path.isdir(self.projdir):
-            shutil.rmtree(self.projdir)
-
-        # create a new project directory
-        os.makedirs(self.projdir)
-        os.makedirs(self.srcdir)
 
         # checkout the commit of interest and get a file list
         self.repo.git.checkout(commit)
         fileset = self._get_fileset_from_commit(commit.tree, fileset=[])
         fileset = [os.path.join(self.gitroot, f) for f in fileset]
 
+        # create a source directory for the current project
+        this_srcdir = os.path.join(commitdir, self.srcdir)
+        os.makedirs(this_srcdir)
+
         # copy all the files from the commit of interest to the new project dir
         for f in fileset:
-            shutil.copy(f, self.srcdir)
-
-    def _run_vivado_implementation(self, run_name, commit_idx, clk_period, ref_dcp=None):
-        '''
-        Build a checkpoint from the commit_idx. If ref_dcp is not provided build
-        a reference checkpoint, otherwise build an incremental checkpoint based
-        on the reference. Constrain the clk with clk_period.
-
-        TODO: vivado specific
-        '''
-        # initialize the project directory with the oldest commit
-        self._init_projdir_from_commit_index(commit_idx)
-
-        # add a constraint file
-        constraint = ['create_clock -name '+
-                     self.clk_name+
-                     ' -period '+
-                     '{:.2f}'.format(clk_period)+
-                     ' [get_ports '+
-                     self.clk_name+
-                     ']']
-        self._write_file(constraint, os.path.join(self.srcdir, self.constraint_name))
-
-        # figure out relative paths to required directories
-        relative_srcdir = os.path.basename(os.path.normpath(self.srcdir))
-        relative_constraint = os.path.join(relative_srcdir, self.constraint_name)
-        relative_datadir = os.path.join('..',os.path.basename(os.path.normpath(self.datadir)),run_name)
-        relative_refdcp = 'null'
-
-        add_ref_lines = False
-        add_inc_lines = False
-        if ref_dcp is None:
-            add_ref_lines = True
-        else:
-            add_inc_lines = True
-            relative_refdcp = os.path.join(relative_datadir, os.path.basename(ref_dcp))
-
-        script = [
-            'file mkdir '+run_name,
-            'create_project -part xcvu3p-ffvc1517-3-e '+run_name+' '+run_name,
-            'add_files '+relative_srcdir,
-            'import_files -fileset constrs_1 -force -norecurse '+relative_constraint,
-            'import_files -force',
-            'set_property -name {STEPS.SYNTH_DESIGN.ARGS.MORE OPTIONS} -value {'+self.vivado_synth_args+'} -objects [get_runs synth_1]',
-            *([ # build reference implementation
-            'set_property AUTO_INCREMENTAL_CHECKPOINT 1 [get_runs impl_1]',
-            'set_property AUTO_INCREMENTAL_CHECKPOINT.DIRECTORY . [get_runs impl_1]',
-            ]*add_ref_lines),
-            *([ # build incremental implementation
-            'set_property incremental_checkpoint '+relative_refdcp+' [get_runs impl_1]',
-            ]*add_inc_lines),
-            'launch_runs synth_1',
-            'wait_on_run synth_1',
-            'launch_runs impl_1',
-            'wait_on_run impl_1',
-            'open_run impl_1',
-            'write_checkpoint -force '+os.path.join(relative_datadir, run_name+'.dcp'),
-            # reporting
-            'report_timing -file '+os.path.join(relative_datadir, 'timing.log'),
-            'report_utilization -file '+os.path.join(relative_datadir, 'util.log'),
-            *([
-            'report_incremental_reuse -file '+os.path.join(relative_datadir, 'reuse.log'),
-            ]*add_inc_lines),
-            'exit',
-            ]
-        self._write_file(script, os.path.join(self.projdir, self.reference_script))
-        subprocess.run(['vivado', '-mode', 'tcl', '-source', self.reference_script], cwd=self.projdir, capture_output=True)
-        shutil.copy(os.path.join(self.projdir, ('vivado.log')), os.path.join(self.datadir, run_name))
+            shutil.copy(f, this_srcdir)
 
     def _get_fileset_from_commit(self, root, level=0, fileset=[]):
         '''
@@ -182,10 +177,29 @@ class IncrementalCharacterizationExperiment:
                 fileset = self._get_fileset_from_commit(entry, level + 1, fileset)
         return fileset
 
-    def _fmax_search(self, run_name, commit_idx, ref_dcp=None):
+    def _write_file(self, contents, filename):
+        '''
+        Write each string from the list contets to the filename
+        '''
+        with open(filename, 'w') as f:
+            for line in contents:
+                f.write(line+'\n')
+
+    def _check_log(self, logfile, success_msg):
+        '''
+        Check each line of logfile to see if it contains success_msg.
+        '''
+        with open(logfile, 'r') as log:
+            loglines = log.readlines()
+        for line in loglines:
+            if success_msg in line:
+                return True
+        return False
+
+    def _fmax_search(self, commit_idx, tool_fn, extra_tool_args):
         '''
         Run binary search to find the fmax of the design at the commit_idx, which
-        may optionally be an incremental implementation of the ref_dcp
+        may optionally be an incremental implementation
         '''
 
         # run binary search to determine fmax
@@ -193,12 +207,10 @@ class IncrementalCharacterizationExperiment:
         coef = 0.5
         guesses = []
         period_ns = 3
-        for _ in range(self.fmax_search_steps):
-
+        for step in range(self.fmax_search_steps):
+            print('\tT SEARCH: Running step '+str(step)+' of '+str(self.fmax_search_steps))
             # guess Tmin == period_ns
-            self._run_vivado_implementation(run_name, commit_idx, period_ns, ref_dcp)
-
-            success = self._check_log(os.path.join(self.datadir,run_name,'timing.log'), 'Slack (MET) :')
+            success = tool_fn(commit_idx, period_ns, **extra_tool_args)
 
             if success: # period_ns too high
                 guesses.append(str(period_ns)+' too high')
@@ -221,24 +233,93 @@ class IncrementalCharacterizationExperiment:
                 success = guesses[idx].split()[-1]
                 if success == 'high':
                     break
-            self._run_vivado_implementation(run_name, commit_idx, tmin, ref_dcp)
-            print('\tPNR: Last guess failed, re-running last successful')
+            print('\tT SEARCH: Last guess failed, re-running last successful')
+            tool_fn(commit_idx, period_ns, **extra_tool_args)
         else:
-            print('\tPNR: Last guess successful')
+            print('\tT SEARCH: Last guess successful')
 
         # record the value of Tmin found
-        self._write_file(guesses, os.path.join(self.datadir,run_name, 'tmin.txt'))
+        self._write_file(guesses, os.path.join(self.commitdirs[commit_idx], self.tmin_file))
 
-    def _check_log(self, logfile, success_msg):
+    def _run_vivado_implementation(self, commit_idx, period_ns, ref_dcp=None):
         '''
-        Check each line of logfile to see if it contains success_msg.
+        Use Vivado to build a checkpoint from commit_idx, constrained with
+        period_ns, and optionally based on ref_dcp.
+
+        if ref_dcp is None build using the reference flow
+        Otherwise attempt to build an incremental checkpoint based on ref_dcp
+
+        returns True if timing constraints were met, False otherwise.
         '''
-        with open(logfile, 'r') as log:
-            loglines = log.readlines()
-        for line in loglines:
-            if success_msg in line:
-                return True
-        return False
+
+        # filenames and paths
+        constraint_name = 'vivado_sdc.sdc'
+        build_script_name = 'vivado_build.tcl'
+
+        this_commitdir = self.commitdirs[commit_idx]
+        this_constraint = os.path.join(this_commitdir, constraint_name)
+
+        run_name = os.path.basename(this_commitdir)
+
+        # add a constraint file
+        constraint = ['create_clock -name '+
+                     self.clk_name+
+                     ' -period '+
+                     '{:.2f}'.format(period_ns)+
+                     ' [get_ports '+
+                     self.clk_name+
+                     ']']
+        self._write_file(constraint, this_constraint)
+
+        add_ref_lines = False
+        add_inc_lines = False
+        if ref_dcp is None:
+            add_ref_lines = True
+            relative_refdcp = ''
+        else:
+            add_inc_lines = True
+            relative_refdcp = os.path.join('..', ref_dcp)
+
+        script = [
+            'file mkdir '+run_name,
+            'create_project -force -part xcvu3p-ffvc1517-3-e '+run_name+' '+run_name,
+            'add_files '+self.srcdir,
+            'import_files -fileset constrs_1 -force -norecurse '+constraint_name,
+            'import_files -force',
+            'set_property -name {STEPS.SYNTH_DESIGN.ARGS.MORE OPTIONS} -value {'+self.vivado_synth_args+'} -objects [get_runs synth_1]',
+            *([ # build reference implementation
+            'set_property AUTO_INCREMENTAL_CHECKPOINT 1 [get_runs impl_1]',
+            'set_property AUTO_INCREMENTAL_CHECKPOINT.DIRECTORY . [get_runs impl_1]',
+            ]*add_ref_lines),
+            *([ # build incremental implementation
+            'set_property incremental_checkpoint '+relative_refdcp+' [get_runs impl_1]',
+            ]*add_inc_lines),
+            'launch_runs synth_1',
+            'wait_on_run synth_1',
+            'launch_runs impl_1',
+            'wait_on_run impl_1',
+            'open_run impl_1',
+            'write_checkpoint -force '+run_name+'.dcp',
+            # reporting
+            'report_timing -file timing.log',
+            'report_utilization -file util.log',
+            *([
+            'report_incremental_reuse -file reuse.log',
+            ]*add_inc_lines),
+            'exit',
+            ]
+        self._write_file(script, os.path.join(this_commitdir, build_script_name))
+
+        # run Vivado and measure how long it takes to complete
+        start = time.time()
+        subprocess.run(['vivado', '-mode', 'tcl', '-source', build_script_name], cwd=this_commitdir, capture_output=True)
+        stop = time.time()
+
+        elapsed = stop - start
+        self._write_file([str(elapsed)], os.path.join(this_commitdir, 'elapsed.txt'))
+
+        success = self._check_log(os.path.join(this_commitdir,'timing.log'), 'Slack (MET) :')
+        return success
 
 def main():
     parser = argparse.ArgumentParser(
@@ -248,10 +329,12 @@ def main():
 
     parser.add_argument('benchmark', type=str, help='Path to the benchmark to characterize')
     parser.add_argument('-c', '--clean', action='store_true', help='Cleanup the characterization experiment associated with the named benchmark')
+    parser.add_argument('--start_commit', type=int, default=None, help='Index of commit to start experiment at')
+    parser.add_argument('--stop_commit', type=int, default=None, help='Index of commit to stop experiment at')
 
     args = parser.parse_args()
 
-    ice = IncrementalCharacterizationExperiment(args.benchmark)
+    ice = IncrementalCharacterizationExperiment(args.benchmark, args.start_commit, args.stop_commit)
 
     if args.clean:
         ice.clean_experiment()
