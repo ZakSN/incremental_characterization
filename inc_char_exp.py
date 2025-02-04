@@ -23,7 +23,10 @@ class IncrementalCharacterizationExperiment:
         self.benchmark         = benchmark_desc[self.name]
         self.branch_name       = self.benchmark['branch']
         self.clk_name          = self.benchmark['clock']
-        self.vivado_synth_args = self.benchmark['vivado-synth-args']
+        try:
+            self.vivado_synth_args = self.benchmark['vivado-synth-args']
+        except:
+            self.vivado_synth_args = ''
 
         # Assume the benchmark repo is located in the same directory as the desc
         self.gitroot = benchmark_desc_file.split('.')[0]
@@ -35,7 +38,7 @@ class IncrementalCharacterizationExperiment:
         self.commitdirs = []
 
         # Experimental settings
-        self.fmax_search_steps = 2
+        self.fmax_search_steps = 6
         self.start_commit = start_commit
         self.stop_commit = stop_commit
 
@@ -208,7 +211,7 @@ class IncrementalCharacterizationExperiment:
         guesses = []
         period_ns = 3
         for step in range(self.fmax_search_steps):
-            print('\tT SEARCH: Running step '+str(step)+' of '+str(self.fmax_search_steps))
+            print('\tT SEARCH: Running step '+str(step+1)+' of '+str(self.fmax_search_steps))
             # guess Tmin == period_ns
             success = tool_fn(commit_idx, period_ns, **extra_tool_args)
 
