@@ -23,6 +23,7 @@ class IncrementalCharacterizationExperiment:
         self.benchmark         = benchmark_desc[self.name]
         self.branch_name       = self.benchmark['branch']
         self.clk_name          = self.benchmark['clock']
+        self.top               = self.benchmark['top']
         try:
             self.vivado_synth_args = self.benchmark['vivado-synth-args']
         except:
@@ -289,6 +290,7 @@ class IncrementalCharacterizationExperiment:
             'add_files '+self.srcdir,
             'import_files -fileset constrs_1 -force -norecurse '+constraint_name,
             'import_files -force',
+            'set_property top '+self.top+' [current_fileset]',
             'set_property -name {STEPS.SYNTH_DESIGN.ARGS.MORE OPTIONS} -value {'+self.vivado_synth_args+'} -objects [get_runs synth_1]',
             *([ # build reference implementation
             'set_property AUTO_INCREMENTAL_CHECKPOINT 1 [get_runs impl_1]',
@@ -296,6 +298,9 @@ class IncrementalCharacterizationExperiment:
             ]*add_ref_lines),
             *([ # build incremental implementation
             'set_property incremental_checkpoint '+relative_refdcp+' [get_runs impl_1]',
+            #'set_property incremental_checkpoint.directive RuntimeOptimized [get_runs impl_1]',
+            #'set_property incremental_checkpoint.directive TimingClosure [get_runs impl_1]',
+            'set_property incremental_checkpoint.directive Quick [get_runs impl_1]',
             ]*add_inc_lines),
             'launch_runs synth_1',
             'wait_on_run synth_1',
