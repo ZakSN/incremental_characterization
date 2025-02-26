@@ -10,7 +10,7 @@ import distutils
 
 class IncrementalCharacterizationExperiment:
 
-    def __init__(self, benchmark_desc_file, start_commit=None, stop_commit=None):
+    def __init__(self, benchmark_desc_file, tool, start_commit=None, stop_commit=None):
         '''
         Initialize an incremental characterization experiment based on the
         benchmark repository located at gitroot.
@@ -30,11 +30,13 @@ class IncrementalCharacterizationExperiment:
         except:
             self.vivado_synth_args = ''
 
+        self.tool = tool
+
         # Assume the benchmark repo is located in the same directory as the desc
         self.gitroot = benchmark_desc_file.split('.')[0]
 
         # Set default names for project directories
-        self.expdir = self.name + '_inc_exp'
+        self.expdir = self.name + '_' + self.tool + '_inc_exp'
         self.srcdir = 'src'
         self.tmin_file = 'tmin.txt'
         self.commitdirs = []
@@ -81,24 +83,23 @@ class IncrementalCharacterizationExperiment:
             print("QUITTING: start_commit invalid")
             exit()
 
-        # TODO: mechanism to choose other tools
-        #tool_fn = self._run_vivado_implementation
-        '''
-        def compute_extra_args(cidx):
-            if cidx == root_commit:
-                return {'ref_dcp': None}
-            else:
-                prev_commit = os.path.basename(self.commitdirs[cidx+1])
-                prev_dcp = os.path.join(prev_commit,prev_commit+'.dcp')
-                return {'ref_dcp': prev_dcp}
-        '''
-        tool_fn = self._run_quartus_implementation
-        def compute_extra_args(cidx):
-            if cidx == root_commit:
-                return {'ref_prj': None}
-            else:
-                prev_commit = self.commitdirs[cidx+1]
-                return {'ref_prj': prev_commit}
+        if self.tool == 'vivado':
+            tool_fn = self._run_vivado_implementation
+            def compute_extra_args(cidx):
+                if cidx == root_commit:
+                    return {'ref_dcp': None}
+                else:
+                    prev_commit = os.path.basename(self.commitdirs[cidx+1])
+                    prev_dcp = os.path.join(prev_commit,prev_commit+'.dcp')
+                    return {'ref_dcp': prev_dcp}
+        elif self.tool == 'quartus':
+            tool_fn = self._run_quartus_implementation
+            def compute_extra_args(cidx):
+                if cidx == root_commit:
+                    return {'ref_prj': None}
+                else:
+                    prev_commit = self.commitdirs[cidx+1]
+                    return {'ref_prj': prev_commit}
 
         for cidx in reversed(range(self.stop_commit, self.start_commit+1)):
             if os.path.isfile(os.path.join(self.commitdirs[cidx],self.tmin_file)):
@@ -387,7 +388,6 @@ class IncrementalCharacterizationExperiment:
         ]
         incremental_script = [
             'project_open '+run_name,
-            #'set_global_assignment -name FAST_PRESERVE AUTO -entity '+self.top,
             *enumerate_files,
             'project_close',
         ]
@@ -400,10 +400,6 @@ class IncrementalCharacterizationExperiment:
             if os.path.exists(os.path.join(this_commitdir, 'qdb')):
                 shutil.rmtree(os.path.join(this_commitdir, 'qdb'))
             shutil.copytree(os.path.join(ref_prj, 'qdb'), os.path.join(this_commitdir, 'qdb'))
-            #distutils.dir_util.copy_tree(os.path.join(ref_prj, 'qdb'), os.path.join(this_commitdir, 'qdb'))
-
-            #distutils.dir_util.copy_tree(os.path.join(ref_prj, 'DNI'), this_commitdir)
-            #distutils.dir_util.copy_tree(os.path.join(ref_prj, 'tmp-clearbox'), this_commitdir)
             self._write_file(incremental_script, os.path.join(this_commitdir, build_script_name))
 
         # run Quartus and measure how long it takes to complete
@@ -431,13 +427,14 @@ def main():
     )
 
     parser.add_argument('benchmark', type=str, help='Path to the benchmark to characterize')
+    parser.add_argument('tool', choices=['vivado', 'quartus'], help='FPGA tool to use for the characterization experiment')
     parser.add_argument('-c', '--clean', action='store_true', help='Cleanup the characterization experiment associated with the named benchmark')
     parser.add_argument('--start_commit', type=int, default=None, help='Index of commit to start experiment at')
     parser.add_argument('--stop_commit', type=int, default=None, help='Index of commit to stop experiment at')
 
     args = parser.parse_args()
 
-    ice = IncrementalCharacterizationExperiment(args.benchmark, args.start_commit, args.stop_commit)
+    ice = IncrementalCharacterizationExperiment(args.benchmark, args.tool, args.start_commit, args.stop_commit)
 
     if args.clean:
         ice.clean_experiment()
