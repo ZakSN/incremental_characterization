@@ -6,6 +6,7 @@ import subprocess
 import math
 import time
 import configparser
+import distutils
 
 class IncrementalCharacterizationExperiment:
 
@@ -81,7 +82,8 @@ class IncrementalCharacterizationExperiment:
             exit()
 
         # TODO: mechanism to choose other tools
-        tool_fn = self._run_vivado_implementation
+        #tool_fn = self._run_vivado_implementation
+        '''
         def compute_extra_args(cidx):
             if cidx == root_commit:
                 return {'ref_dcp': None}
@@ -89,6 +91,14 @@ class IncrementalCharacterizationExperiment:
                 prev_commit = os.path.basename(self.commitdirs[cidx+1])
                 prev_dcp = os.path.join(prev_commit,prev_commit+'.dcp')
                 return {'ref_dcp': prev_dcp}
+        '''
+        tool_fn = self._run_quartus_implementation
+        def compute_extra_args(cidx):
+            if cidx == root_commit:
+                return {'ref_prj': None}
+            else:
+                prev_commit = self.commitdirs[cidx+1]
+                return {'ref_prj': prev_commit}
 
         for cidx in reversed(range(self.stop_commit, self.start_commit+1)):
             if os.path.isfile(os.path.join(self.commitdirs[cidx],self.tmin_file)):
@@ -214,7 +224,7 @@ class IncrementalCharacterizationExperiment:
         for step in range(self.fmax_search_steps):
             print('\tT SEARCH: Running step '+str(step+1)+' of '+str(self.fmax_search_steps))
             # guess Tmin == period_ns
-            success = tool_fn(commit_idx, period_ns, **extra_tool_args)
+            success = tool_fn(commit_idx, period_ns, extra_tool_args)
 
             if success: # period_ns too high
                 guesses.append(str(period_ns)+' too high')
@@ -238,14 +248,24 @@ class IncrementalCharacterizationExperiment:
                 if success == 'high':
                     break
             print('\tT SEARCH: Last guess failed, re-running last successful')
-            tool_fn(commit_idx, period_ns, **extra_tool_args)
+            tool_fn(commit_idx, period_ns, extra_tool_args)
         else:
             print('\tT SEARCH: Last guess successful')
 
         # record the value of Tmin found
         self._write_file(guesses, os.path.join(self.commitdirs[commit_idx], self.tmin_file))
 
-    def _run_vivado_implementation(self, commit_idx, period_ns, ref_dcp=None):
+    def _write_clock_constraint(self, filename, period_ns):
+        constraint = ['create_clock -name '+
+                     self.clk_name+
+                     ' -period '+
+                     '{:.2f}'.format(period_ns)+
+                     ' [get_ports '+
+                     self.clk_name+
+                     ']']
+        self._write_file(constraint, filename)
+
+    def _run_vivado_implementation(self, commit_idx, period_ns, extra_args):
         '''
         Use Vivado to build a checkpoint from commit_idx, constrained with
         period_ns, and optionally based on ref_dcp.
@@ -256,6 +276,8 @@ class IncrementalCharacterizationExperiment:
         returns True if timing constraints were met, False otherwise.
         '''
 
+        ref_dcp = extra_args['ref_dcp']
+
         # filenames and paths
         constraint_name = 'vivado_sdc.sdc'
         build_script_name = 'vivado_build.tcl'
@@ -265,15 +287,7 @@ class IncrementalCharacterizationExperiment:
 
         run_name = os.path.basename(this_commitdir)
 
-        # add a constraint file
-        constraint = ['create_clock -name '+
-                     self.clk_name+
-                     ' -period '+
-                     '{:.2f}'.format(period_ns)+
-                     ' [get_ports '+
-                     self.clk_name+
-                     ']']
-        self._write_file(constraint, this_constraint)
+        self._write_clock_constraint(this_constraint, period_ns)
 
         add_ref_lines = False
         add_inc_lines = False
@@ -327,6 +341,87 @@ class IncrementalCharacterizationExperiment:
         self._write_file([str(elapsed)], os.path.join(this_commitdir, 'elapsed.txt'))
 
         success = self._check_log(os.path.join(this_commitdir,'timing.log'), 'Slack (MET) :')
+        return success
+
+    def _run_quartus_implementation(self, commit_idx, period_ns, extra_args):
+
+        ref_prj = extra_args['ref_prj']
+
+        # filenames and paths
+        constraint_name = 'quartus_sdc.sdc'
+        build_script_name = 'quartus_build.tcl'
+
+        this_commitdir = self.commitdirs[commit_idx]
+        this_constraint = os.path.join(this_commitdir, constraint_name)
+
+        run_name = 'autoqpf'
+
+        outputdir = 'output_files'
+
+        self._write_clock_constraint(this_constraint, period_ns)
+
+        enumerate_files = [
+            'set sources [glob '+self.srcdir+'/*]',
+            'foreach src $sources {',
+            '    set ext [file extension $src]',
+            '    switch $ext {',
+            '        .v -',
+            '        .vh {set filetype VERILOG_FILE}',
+            '        .sv -',
+            '        .svh {set filetype SYSTEMVERILOG_FILE}',
+            '        .vdh {set filetype VHDL_FILE}',
+            '    }',
+            '    set_global_assignment -name $filetype $src',
+            '}',
+        ]
+        root_script = [
+            'project_new '+run_name+' -overwrite',
+            'set_global_assignment -name TOP_LEVEL_ENTITY '+self.top,
+            'set_global_assignment -name FAMILY "Arria 10"',
+            'set_global_assignment -name DEVICE 10AS016E3F27E1HG',
+            'set_global_assignment -name PROJECT_OUTPUT_DIRECTORY '+outputdir,
+            'set_global_assignment -name SDC_FILE '+constraint_name,
+            'set_global_assignment -name ENABLE_INTERMEDIATE_SNAPSHOTS ON',
+            *enumerate_files,
+            'project_close',
+        ]
+        incremental_script = [
+            'project_open '+run_name,
+            #'set_global_assignment -name FAST_PRESERVE AUTO -entity '+self.top,
+            *enumerate_files,
+            'project_close',
+        ]
+        if ref_prj is None:
+            self._write_file(root_script, os.path.join(this_commitdir, build_script_name))
+        else:
+            shutil.copy(os.path.join(ref_prj, run_name+'.qsf'), this_commitdir)
+            shutil.copy(os.path.join(ref_prj, run_name+'.qpf'), this_commitdir)
+
+            if os.path.exists(os.path.join(this_commitdir, 'qdb')):
+                shutil.rmtree(os.path.join(this_commitdir, 'qdb'))
+            shutil.copytree(os.path.join(ref_prj, 'qdb'), os.path.join(this_commitdir, 'qdb'))
+            #distutils.dir_util.copy_tree(os.path.join(ref_prj, 'qdb'), os.path.join(this_commitdir, 'qdb'))
+
+            #distutils.dir_util.copy_tree(os.path.join(ref_prj, 'DNI'), this_commitdir)
+            #distutils.dir_util.copy_tree(os.path.join(ref_prj, 'tmp-clearbox'), this_commitdir)
+            self._write_file(incremental_script, os.path.join(this_commitdir, build_script_name))
+
+        # run Quartus and measure how long it takes to complete
+        start = time.time()
+        verbose = False
+        subprocess.run(['quartus_sh', '-t', build_script_name], cwd=this_commitdir, capture_output=(not verbose))
+        if ref_prj is None:
+            subprocess.run(['quartus_syn', run_name], cwd=this_commitdir, capture_output=(not verbose))
+            subprocess.run(['quartus_fit', run_name], cwd=this_commitdir, capture_output=(not verbose))
+        else:
+            subprocess.run(['quartus_syn', '--recompile', run_name], cwd=this_commitdir, capture_output=(not verbose))
+            subprocess.run(['quartus_fit', '--recompile=on', run_name], cwd=this_commitdir, capture_output=(not verbose))
+        subprocess.run(['quartus_sta', run_name], cwd=this_commitdir, capture_output=(not verbose))
+        stop = time.time()
+
+        elapsed = stop - start
+        self._write_file([str(elapsed)], os.path.join(this_commitdir, 'elapsed.txt'))
+        success = self._check_log(os.path.join(this_commitdir, outputdir, run_name+'.sta.rpt'), 'Quartus Prime Timing Analyzer was successful. 0 errors, 0 warnings')
         return success
 
 def main():
