@@ -61,6 +61,19 @@ def read_timing_log(path):
         logger.warning('Could not open '+path)
     return None, None, None, None
 
+def read_reuse_log(expdir):
+    cell_reuse = 0
+    percent_reuse = 0.0
+    try:
+        reuse_log = open(expdir)
+        reuse_log = reuse_log.readlines()
+        cell_reuse = int(reuse_log[48].split('|')[-2])
+        percent_reuse = float(reuse_log[48].split('|')[-4])
+    except:
+        pass
+    return cell_reuse, percent_reuse
+
+
 def read_incremental_logs(expdir):
     # get a list of available experiment directories
     exps = [f.path for f in os.scandir(expdir) if f.is_dir()]
@@ -78,6 +91,8 @@ def read_incremental_logs(expdir):
         e['fmax_hi'], e['fmax_lo'], e['fmax_mid'], e['steps'] = read_timing_log(os.path.join(e['path'], 'tmin.txt'))
         # Check if this commit is incremental or not
         e['reuse'] = os.path.isfile(os.path.join(e['path'], 'reuse.log'))
+        # Reuse stats
+        e['cell_reuse'], e['percent_reuse'] = read_reuse_log(os.path.join(e['path'], 'reuse.log'))
 
     return exps
 
@@ -111,6 +126,7 @@ def plot_area(ax, inc_data, std_data):
     y_std = [e['area'] for e in std_data]
     ax.scatter(x, y_inc, marker='.', label='inc')
     ax.scatter(x, y_std, marker='.', label='std')
+    ax.set_ylabel("Area [# LUTs]")
 
 def plot_cumulative_runtime(ax, inc_data, std_data):
     x = [e['commit'] for e in inc_data]
@@ -125,6 +141,7 @@ def plot_cumulative_runtime(ax, inc_data, std_data):
 
     ax.scatter(x, sigma_t_inc, marker='.', label='inc')
     ax.scatter(x, sigma_t_std, marker='.', label='std')
+    ax.set_ylabel("IRT [s]")
 
 def plot_fmax(ax, inc_data, std_data):
     x = [e['commit'] for e in inc_data]
@@ -135,6 +152,22 @@ def plot_fmax(ax, inc_data, std_data):
 
     ax.errorbar(x, fmax_inc, fmax_inc_error, fmt='.', label='inc')
     ax.errorbar(x, fmax_std, fmax_std_error, fmt='.', label='std')
+    ax.set_ylabel("$f_{max}$ [Hz]")
+
+def plot_cell_reuse(ax, inc_data):
+    x = [e['commit'] for e in inc_data]
+    cell_reuse = [e['cell_reuse'] for e in inc_data]
+
+    ax.scatter(x, cell_reuse, marker='.', label='Vivado')
+    ax.set_ylabel("# Cells Reused")
+
+def plot_percent_reuse(ax, inc_data):
+    x = [e['commit'] for e in inc_data]
+    percent_reuse = [e['percent_reuse'] for e in inc_data]
+
+    ax.scatter(x, percent_reuse, marker='.', label='Vivado')
+    ax.set_ylim(0.0, 100.0)
+    ax.set_ylabel("% Cells Reused")
 
 def plot_results(inc_data, std_data):
     fig, axs = plt.subplots(3,1)
@@ -148,8 +181,22 @@ def plot_results(inc_data, std_data):
             ax.axvline(x=x, color='tab:gray')
         ax.grid(visible=True, which='both')
         ax.legend()
+    axs[-1].set_xlabel("Commit Number")
     plt.show()
 
+def plot_reuse(inc_data):
+    fig, axs = plt.subplots(2,1)
+    plot_cell_reuse(axs[0], inc_data)
+    plot_percent_reuse(axs[1], inc_data)
+    rebuilds = [e['commit'] for e in inc_data if not e['reuse']]
+    for ax in axs:
+        ax.invert_xaxis()
+        for x in rebuilds:
+            ax.axvline(x=x, color='tab:gray')
+        ax.grid(visible=True, which='both')
+        ax.legend()
+    axs[-1].set_xlabel("Commit Number")
+    plt.show()
 
 def main():
     parser = argparse.ArgumentParser(prog='plot_results.py', description='Plot a comparison of incremental and standard data')
@@ -160,6 +207,8 @@ def main():
     inc_data = read_incremental_logs(args.inc_exp)
     std_data = read_standard_logs(args.std_exp)
     plot_results(inc_data, std_data)
+
+    plot_reuse(inc_data)
 
 if __name__ == '__main__':
     main()
