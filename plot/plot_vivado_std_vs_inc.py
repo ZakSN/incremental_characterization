@@ -4,8 +4,8 @@ import parse_logs
 
 def plot_area(ax, inc_data, std_data):
     x = [e['commit'] for e in inc_data]
-    y_inc = [e['area'] for e in inc_data]
-    y_std = [e['area'] for e in std_data]
+    y_inc = [e['clb_luts'] for e in inc_data]
+    y_std = [e['clb_luts'] for e in std_data]
     ax.scatter(x, y_inc, marker='.', label='inc')
     ax.scatter(x, y_std, marker='.', label='std')
     ax.set_ylabel("Area [# LUTs]")
@@ -38,14 +38,14 @@ def plot_fmax(ax, inc_data, std_data):
 
 def plot_cell_reuse(ax, inc_data):
     x = [e['commit'] for e in inc_data]
-    cell_reuse = [e['cell_reuse'] for e in inc_data]
+    cell_reuse = [e.get('cell_total', 0)*e.get('p_cell_reuse', 0) for e in inc_data]
 
     ax.scatter(x, cell_reuse, marker='.', label='Vivado')
     ax.set_ylabel("# Cells Reused")
 
 def plot_percent_reuse(ax, inc_data):
     x = [e['commit'] for e in inc_data]
-    percent_reuse = [e['percent_reuse'] for e in inc_data]
+    percent_reuse = [e.get('p_cell_reuse', 0)*100 for e in inc_data]
 
     ax.scatter(x, percent_reuse, marker='.', label='Vivado')
     ax.set_ylim(0.0, 100.0)
@@ -81,7 +81,7 @@ def plot_reuse(inc_data):
     plt.show()
 
 def main():
-    parser = argparse.ArgumentParser(prog='plot_results.py', description='Plot a comparison of incremental and standard data')
+    parser = argparse.ArgumentParser(prog='plot_vivado_std_vs_inc.py', description='Plot a comparison of incremental and standard data for Vivado')
     parser.add_argument('std_exp', type=str, help='Path to the root of the standard flow experiment')
     parser.add_argument('inc_exp', type=str, help='Path to the root of the incremental flow experiment')
     args = parser.parse_args()
