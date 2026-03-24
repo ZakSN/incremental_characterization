@@ -4,7 +4,10 @@ logger = logging.getLogger(__name__)
 import glob
 
 def print_experiment_results(exps):
-    kl = list(exps[0].keys())
+    kl = []
+    for e in exps:
+        if len(e.keys()) > len(kl):
+            kl = list(e.keys())
     print(' '.join(kl))
     for idx in range(len(exps)):
         for k in kl:
@@ -102,13 +105,14 @@ def read_timing_log(path, e):
 
 def read_vivado_reuse_log(path, e):
     cell_line = 47
+    net_line = 48
     try:
         reuse_log = open(path)
         reuse_log = reuse_log.readlines()
-        cell_total = int(reuse_log[cell_line].split('|')[-2])
-        percent_reuse = float(reuse_log[cell_line].split('|')[-4])
-        e['cell_total'] = cell_total
-        e['p_cell_reuse'] = percent_reuse/100
+        e['cell_total']   = int(reuse_log[cell_line].split('|')[-2])
+        e['p_cell_reuse'] = float(reuse_log[cell_line].split('|')[-4])/100
+        e['net_total']   = int(reuse_log[net_line].split('|')[-2])
+        e['p_net_reuse'] = float(reuse_log[net_line].split('|')[-4])/100
     except FileNotFoundError:
         logger.warning('Could not open '+path)
     return e
@@ -117,14 +121,13 @@ def read_df_reuse_log(path, e):
     try:
         reuse_log = open(path)
         reuse_log = reuse_log.readlines()
-        cell_reuse = int(reuse_log[2].split(' ')[1])
-        p_cell_reuse = float(reuse_log[2].split(' ')[8].replace('(', '').replace(')', ''))
-        net_reuse = int(reuse_log[4].split(' ')[1])
-        p_net_reuse = float(reuse_log[4].split(' ')[8].replace('(', '').replace(')', ''))
-        e['reused_cells'] = cell_reuse
-        e['p_cell_reuse'] = p_cell_reuse/100
-        e['reused_nets']  = net_reuse
-        e['p_net_reuse']  = p_net_reuse/100
+        e['reused_cells']    = int(reuse_log[7].split(' ')[0])
+        e['last_cell_total'] = int(reuse_log[3].split(' ')[0])
+        e['p_cell_reuse']    = float(reuse_log[12].split(' ')[8].replace('(', '').replace(')', ''))/100
+        e['reused_nets']     = int(reuse_log[8].split(' ')[0])
+        e['last_net_total']  = int(reuse_log[4].split(' ')[0])
+        e['p_net_reuse']  = float(reuse_log[14].split(' ')[8].replace('(', '').replace(')', ''))/100
+        e['reuse'] = 'Incremental' in reuse_log[0]
         return e
     except FileNotFoundError:
         logger.warning('Could not open '+path)
@@ -180,8 +183,14 @@ def read_deltaFPGA_incremental_logs(expdir):
 
     for e in exps:
         e = read_util_log_clb_luts(os.path.join(e['path'], 'after_PNR_util.log'), e)
-        e = read_util_log_primitives(glob.glob(os.path.join(e['path'], '1_*_util.log'))[0], e)
         e = read_util_log_primitives(os.path.join(e['path'], 'after_PNR_util.log'), e)
         e = read_df_reuse_log(os.path.join(e['path'], 'test_report.log'), e)
+        try:
+            e['clb_luts']
+        except KeyError:
+            e['clb_luts'] = 0
+            e['primitives'] = 0
+            e['reused_cells'] = 0
+            e['reused_nets'] = 0
 
     return exps
