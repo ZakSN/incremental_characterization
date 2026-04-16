@@ -10,7 +10,7 @@ import distutils
 
 class IncrementalCharacterizationExperiment:
 
-    def __init__(self, benchmark_desc_file, tool, start_commit=None, stop_commit=None):
+    def __init__(self, benchmark_desc_file, tool, no_timing, start_commit=None, stop_commit=None):
         '''
         Initialize an incremental characterization experiment based on the
         benchmark repository located at gitroot.
@@ -42,7 +42,10 @@ class IncrementalCharacterizationExperiment:
         self.commitdirs = []
 
         # Experimental settings
+        self.no_timing = no_timing
         self.fmax_search_steps = 6
+        if self.no_timing:
+            self.fmax_search_steps = 1
         self.start_commit = start_commit
         self.stop_commit = stop_commit
 
@@ -299,11 +302,17 @@ class IncrementalCharacterizationExperiment:
             add_inc_lines = True
             relative_refdcp = os.path.join('..', ref_dcp)
 
+        if self.no_timing:
+            timing_constraint = ' '
+        else:
+            timing_constraint = \
+                'import_files -fileset constrs_1 -force -norecurse '+constraint_name
+
         script = [
             'file mkdir '+run_name,
             'create_project -force -part xcvu3p-ffvc1517-3-e '+run_name+' '+run_name,
             'add_files '+self.srcdir,
-            'import_files -fileset constrs_1 -force -norecurse '+constraint_name,
+            timing_constraint,
             'import_files -force',
             'set_property top '+self.top+' [current_fileset]',
             'set_property -name {STEPS.SYNTH_DESIGN.ARGS.MORE OPTIONS} -value {'+self.vivado_synth_args+'} -objects [get_runs synth_1]',
@@ -341,6 +350,9 @@ class IncrementalCharacterizationExperiment:
         elapsed = stop - start
         self._write_file([str(elapsed)], os.path.join(this_commitdir, 'elapsed.txt'))
 
+        if self.no_timing:
+            return True
+
         success = self._check_log(os.path.join(this_commitdir,'timing.log'), 'Slack (MET) :')
         return success
 
@@ -360,6 +372,12 @@ class IncrementalCharacterizationExperiment:
         outputdir = 'output_files'
 
         self._write_clock_constraint(this_constraint, period_ns)
+
+        if self.no_timing:
+            timing_constraint = ' '
+        else:
+            timing_constraint = \
+                'set_global_assignment -name SDC_FILE '+constraint_name
 
         enumerate_files = [
             'set sources [glob '+self.srcdir+'/*]',
@@ -381,7 +399,7 @@ class IncrementalCharacterizationExperiment:
             'set_global_assignment -name FAMILY "Arria 10"',
             'set_global_assignment -name DEVICE 10AS016E3F27E1HG',
             'set_global_assignment -name PROJECT_OUTPUT_DIRECTORY '+outputdir,
-            'set_global_assignment -name SDC_FILE '+constraint_name,
+            timing_constraint,
             'set_global_assignment -name ENABLE_INTERMEDIATE_SNAPSHOTS ON',
             *enumerate_files,
             'project_close',
@@ -417,6 +435,10 @@ class IncrementalCharacterizationExperiment:
 
         elapsed = stop - start
         self._write_file([str(elapsed)], os.path.join(this_commitdir, 'elapsed.txt'))
+
+        if self.no_timing:
+            return True
+
         success = self._check_log(os.path.join(this_commitdir, outputdir, run_name+'.sta.rpt'), 'Quartus Prime Timing Analyzer was successful. 0 errors, 0 warnings')
         return success
 
@@ -431,10 +453,11 @@ def main():
     parser.add_argument('-c', '--clean', action='store_true', help='Cleanup the characterization experiment associated with the named benchmark')
     parser.add_argument('--start_commit', type=int, default=None, help='Index of commit to start experiment at')
     parser.add_argument('--stop_commit', type=int, default=None, help='Index of commit to stop experiment at')
+    parser.add_argument('--no_timing', action='store_true', help='Skip Fmax search, and do not set timing constraints')
 
     args = parser.parse_args()
 
-    ice = IncrementalCharacterizationExperiment(args.benchmark, args.tool, args.start_commit, args.stop_commit)
+    ice = IncrementalCharacterizationExperiment(args.benchmark, args.tool, args.no_timing, args.start_commit, args.stop_commit)
 
     if args.clean:
         ice.clean_experiment()
