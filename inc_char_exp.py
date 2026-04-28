@@ -10,7 +10,9 @@ import distutils
 
 class IncrementalCharacterizationExperiment:
 
-    def __init__(self, benchmark_desc_file, tool, no_timing, start_commit=None, stop_commit=None):
+    def __init__(self, benchmark_desc_file, tool, no_timing,
+                 start_commit=None, stop_commit=None,
+                 deltaFPGA_args={'deltaFPGA' : None, 'chronbench' : None}):
         '''
         Initialize an incremental characterization experiment based on the
         benchmark repository located at gitroot.
@@ -31,6 +33,13 @@ class IncrementalCharacterizationExperiment:
             self.vivado_synth_args = ''
 
         self.tool = tool
+
+        if self.tool == 'deltaFPGA':
+            if deltaFPGA_args['deltaFPGA'] is None:
+                raise RuntimeError('Location of deltaFPGA entrypoint script is required!')
+            if deltaFPGA_args['chronbench'] is None:
+                raise RuntimeError('Location of correspoinding Chronbench build directory is required!')
+        self.deltaFPGA_args = deltaFPGA_args
 
         # Assume the benchmark repo is located in the same directory as the desc
         self.gitroot = benchmark_desc_file.split('.')[0]
@@ -89,7 +98,7 @@ class IncrementalCharacterizationExperiment:
         if self.tool == 'vivado':
             tool_fn = self._run_vivado_implementation
             def compute_extra_args(cidx):
-                if cidx == root_commit:
+                if cidx == self.start_commit:
                     return {'ref_dcp': None}
                 else:
                     prev_commit = os.path.basename(self.commitdirs[cidx+1])
@@ -98,11 +107,34 @@ class IncrementalCharacterizationExperiment:
         elif self.tool == 'quartus':
             tool_fn = self._run_quartus_implementation
             def compute_extra_args(cidx):
-                if cidx == root_commit:
+                if cidx == self.start_commit:
                     return {'ref_prj': None}
                 else:
                     prev_commit = self.commitdirs[cidx+1]
                     return {'ref_prj': prev_commit}
+        elif self.tool == 'deltaFPGA':
+            tool_fn = self._run_deltaFPGA_implementation
+            def compute_extra_args(cidx):
+                if cidx == self.start_commit:
+                    self.base_compile_dir = os.path.abspath(self.deltaFPGA_args['chronbench'])
+                    self.deltaFPGA_entrypoint = os.path.abspath(self.deltaFPGA_args['deltaFPGA'])
+                    self.base_compiles = os.listdir(self.base_compile_dir)
+                cb_dcp = os.path.join('autoxpr', 'autopnrxpr.dcp')
+                for bc in self.base_compiles:
+                    bc_idx = int(bc.split('_')[0])
+                    if bc_idx == cidx+1:
+                        last_dcp = os.path.join(self.base_compile_dir,bc,cb_dcp)
+                    if bc_idx == cidx:
+                        next_dcp = os.path.join(self.base_compile_dir,bc,cb_dcp)
+                if cidx == root_commit:
+                    return {'last': None, 'next': next_dcp}
+                else:
+                    prev_commit = os.path.abspath(self.commitdirs[cidx+1])
+                    run_name = os.path.basename(self.commitdirs[cidx+1])
+                    inc_last_dcp = os.path.join(prev_commit,run_name+'.dcp')
+                    if os.path.isfile(inc_last_dcp):
+                        last_dcp = inc_last_dcp
+                    return {'last': last_dcp , 'next': next_dcp}
 
         for cidx in reversed(range(self.stop_commit, self.start_commit+1)):
             if os.path.isfile(os.path.join(self.commitdirs[cidx],self.tmin_file)):
@@ -442,6 +474,48 @@ class IncrementalCharacterizationExperiment:
         success = self._check_log(os.path.join(this_commitdir, outputdir, run_name+'.sta.rpt'), 'Quartus Prime Timing Analyzer was successful. 0 errors, 0 warnings')
         return success
 
+    def _run_deltaFPGA_implementation(self, commit_idx, period_ns, extra_args):
+        '''
+        '''
+
+        last_dcp = extra_args['last']
+        next_dcp = extra_args['next']
+
+        # special case: the root commit is always a Base Compile, which we
+        # assume was successful
+        if last_dcp is None:
+            return True
+
+        constraint_name = 'df.sdc'
+        this_commitdir = self.commitdirs[commit_idx]
+        this_constraint = os.path.join(this_commitdir, constraint_name)
+
+        run_name = os.path.basename(this_commitdir)
+        log_name = run_name+'.log'
+
+        self._write_clock_constraint(this_constraint, period_ns)
+
+        # delete results from prior step if they exist
+        prior_result = os.path.join(this_commitdir, run_name+'.dcp')
+        if os.path.isfile(prior_result):
+            os.remove(prior_result)
+
+        start = time.time()
+        subprocess.run(['python3', self.deltaFPGA_entrypoint,
+                        last_dcp, next_dcp, run_name, '--log', log_name,
+                        '--sdc', 'df.sdc'],
+                        cwd=this_commitdir, capture_output=True)
+        stop = time.time()
+
+        elapsed = stop - start
+        self._write_file([str(elapsed)], os.path.join(this_commitdir, 'elapsed.txt'))
+
+        if self.no_timing:
+            return True
+
+        success = self._check_log(os.path.join(this_commitdir, log_name), 'Slack (MET) :')
+        return success
+
 def main():
     parser = argparse.ArgumentParser(
         prog = 'inc_char_exp.py',
@@ -449,15 +523,20 @@ def main():
     )
 
     parser.add_argument('benchmark', type=str, help='Path to the benchmark to characterize')
-    parser.add_argument('tool', choices=['vivado', 'quartus'], help='FPGA tool to use for the characterization experiment')
+    parser.add_argument('tool', choices=['vivado', 'quartus', 'deltaFPGA'], help='FPGA tool to use for the characterization experiment')
     parser.add_argument('-c', '--clean', action='store_true', help='Cleanup the characterization experiment associated with the named benchmark')
     parser.add_argument('--start_commit', type=int, default=None, help='Index of commit to start experiment at')
     parser.add_argument('--stop_commit', type=int, default=None, help='Index of commit to stop experiment at')
     parser.add_argument('--no_timing', action='store_true', help='Skip Fmax search, and do not set timing constraints')
+    parser.add_argument('--deltaFPGA', type=str, default=None, help='Required for deltaFPGA, ignored for all else. Location of deltaFPGA entrypoint script')
+    parser.add_argument('--chronbench', type=str, default=None, help='Required for deltaFPGA, ignored for all else. Location of corresponding Chronbench characterization run')
 
     args = parser.parse_args()
 
-    ice = IncrementalCharacterizationExperiment(args.benchmark, args.tool, args.no_timing, args.start_commit, args.stop_commit)
+    ice = IncrementalCharacterizationExperiment(
+        args.benchmark, args.tool, args.no_timing, args.start_commit,
+        args.stop_commit,
+        {'deltaFPGA' : args.deltaFPGA, 'chronbench' : args.chronbench})
 
     if args.clean:
         ice.clean_experiment()
