@@ -10,7 +10,7 @@ import distutils
 
 class IncrementalCharacterizationExperiment:
 
-    def __init__(self, benchmark_desc_file, tool, no_timing,
+    def __init__(self, benchmark_desc_file, tool, timing,
                  start_commit=None, stop_commit=None,
                  deltaFPGA_args={'deltaFPGA' : None, 'chronbench' : None}):
         '''
@@ -51,10 +51,17 @@ class IncrementalCharacterizationExperiment:
         self.commitdirs = []
 
         # Experimental settings
-        self.no_timing = no_timing
-        self.fmax_search_steps = 6
-        if self.no_timing:
+        self.no_timing = False
+        self.fixed_timing = None
+        if timing == None:
+            self.fmax_search_steps = 6
+        elif timing == True:
+            self.no_timing = True
             self.fmax_search_steps = 1
+        else:
+            self.fixed_timing = timing
+            self.fmax_search_steps = 1
+
         self.start_commit = start_commit
         self.stop_commit = stop_commit
 
@@ -134,6 +141,9 @@ class IncrementalCharacterizationExperiment:
                     inc_last_dcp = os.path.join(prev_commit,run_name+'.dcp')
                     if os.path.isfile(inc_last_dcp):
                         last_dcp = inc_last_dcp
+                        self._write_file(['incremental compile'], os.path.join(self.commitdirs[cidx+1], 'INCREMENTAL_COMPILE.txt'))
+                    else:
+                        self._write_file(['base compile'], os.path.join(self.commitdirs[cidx+1], 'BASE_COMPILE.txt'))
                     return {'last': last_dcp , 'next': next_dcp}
 
         for cidx in reversed(range(self.stop_commit, self.start_commit+1)):
@@ -239,8 +249,11 @@ class IncrementalCharacterizationExperiment:
         '''
         Check each line of logfile to see if it contains success_msg.
         '''
-        with open(logfile, 'r') as log:
-            loglines = log.readlines()
+        try:
+            with open(logfile, 'r') as log:
+                loglines = log.readlines()
+        except FileNotFoundError:
+            return False
         for line in loglines:
             if success_msg in line:
                 return True
@@ -256,7 +269,10 @@ class IncrementalCharacterizationExperiment:
         last_guess_too_high = None
         coef = 0.5
         guesses = []
-        period_ns = 3
+        if self.fixed_timing is not None:
+            period_ns = self.fixed_timing
+        else:
+            period_ns = 3
         for step in range(self.fmax_search_steps):
             print('\tT SEARCH: Running step '+str(step+1)+' of '+str(self.fmax_search_steps))
             # guess Tmin == period_ns
@@ -386,6 +402,10 @@ class IncrementalCharacterizationExperiment:
             return True
 
         success = self._check_log(os.path.join(this_commitdir,'timing.log'), 'Slack (MET) :')
+        if self.fixed_timing is not None:
+            self._write_file(["Met timing: "+str(success)], os.path.join(this_commitdir, 'timing_result.txt'))
+            return True
+
         return success
 
     def _run_quartus_implementation(self, commit_idx, period_ns, extra_args):
@@ -472,6 +492,10 @@ class IncrementalCharacterizationExperiment:
             return True
 
         success = self._check_log(os.path.join(this_commitdir, outputdir, run_name+'.sta.rpt'), 'Quartus Prime Timing Analyzer was successful. 0 errors, 0 warnings')
+        if self.fixed_timing is not None:
+            self._write_file(["Met timing: "+str(success)], os.path.join(this_commitdir, 'timing_result.txt'))
+            return True
+
         return success
 
     def _run_deltaFPGA_implementation(self, commit_idx, period_ns, extra_args):
@@ -487,6 +511,7 @@ class IncrementalCharacterizationExperiment:
             return True
 
         constraint_name = 'df.sdc'
+        build_script_name = 'df_build.tcl'
         this_commitdir = self.commitdirs[commit_idx]
         this_constraint = os.path.join(this_commitdir, constraint_name)
 
@@ -495,15 +520,41 @@ class IncrementalCharacterizationExperiment:
 
         self._write_clock_constraint(this_constraint, period_ns)
 
-        # delete results from prior step if they exist
-        prior_result = os.path.join(this_commitdir, run_name+'.dcp')
-        if os.path.isfile(prior_result):
-            os.remove(prior_result)
+        if self.no_timing:
+            timing_constraint = ' '
+        else:
+            timing_constraint = \
+                'source '+constraint_name
+
+        script = [
+            'open_checkpoint {'+run_name+'.dcp}',
+            'catch {',
+            'place_design',
+            #'reset_timing', #
+            timing_constraint,
+            'route_design',
+            #timing_constraint, #
+            'write_checkpoint -force {'+run_name+'.dcp}',
+            # reporting
+            'report_timing -file timing.log',
+            'report_utilization -file util.log',
+            '}',
+            'exit',
+            ]
+        self._write_file(script, os.path.join(this_commitdir, build_script_name))
 
         start = time.time()
-        subprocess.run(['python3', self.deltaFPGA_entrypoint,
-                        last_dcp, next_dcp, run_name, '--log', log_name,
-                        '--sdc', 'df.sdc'],
+        # run DeltaFPGA
+        inc_next_dcp = os.path.join(os.path.abspath(this_commitdir), run_name+'.dcp')
+        subprocess.run(['./gradlew',
+                        ':run',
+                        '--args='+last_dcp+' '+next_dcp+' '+inc_next_dcp],
+                       cwd=self.deltaFPGA_entrypoint,
+                       capture_output=True)
+
+        # run Vivado
+        subprocess.run(['vivado', '-nojournal', '-log', run_name+'.log',  '-mode',
+                        'tcl', '-source', build_script_name],
                         cwd=this_commitdir, capture_output=True)
         stop = time.time()
 
@@ -513,7 +564,11 @@ class IncrementalCharacterizationExperiment:
         if self.no_timing:
             return True
 
-        success = self._check_log(os.path.join(this_commitdir, log_name), 'Slack (MET) :')
+        success = self._check_log(os.path.join(this_commitdir, 'timing.log'), 'Slack (MET) :')
+        if self.fixed_timing is not None:
+            self._write_file(["Met timing: "+str(success)], os.path.join(this_commitdir, 'timing_result.txt'))
+            return True
+
         return success
 
 def main():
@@ -528,13 +583,23 @@ def main():
     parser.add_argument('--start_commit', type=int, default=None, help='Index of commit to start experiment at')
     parser.add_argument('--stop_commit', type=int, default=None, help='Index of commit to stop experiment at')
     parser.add_argument('--no_timing', action='store_true', help='Skip Fmax search, and do not set timing constraints')
+    parser.add_argument('--fixed_timing', type=float, default=None, help='Timing constraint to use for each version, instead of Fmax search')
     parser.add_argument('--deltaFPGA', type=str, default=None, help='Required for deltaFPGA, ignored for all else. Location of deltaFPGA entrypoint script')
     parser.add_argument('--chronbench', type=str, default=None, help='Required for deltaFPGA, ignored for all else. Location of corresponding Chronbench characterization run')
 
     args = parser.parse_args()
 
+    if (args.no_timing == True) and (args.fixed_timing is not None):
+        print("Incompatible arguments: --no_timing and --fixed_timing="+args.fixed_timing)
+        exit()
+    timing = None
+    if args.no_timing:
+        timing = True
+    if args.fixed_timing is not None:
+        timing = args.fixed_timing
+
     ice = IncrementalCharacterizationExperiment(
-        args.benchmark, args.tool, args.no_timing, args.start_commit,
+        args.benchmark, args.tool, timing, args.start_commit,
         args.stop_commit,
         {'deltaFPGA' : args.deltaFPGA, 'chronbench' : args.chronbench})
 
