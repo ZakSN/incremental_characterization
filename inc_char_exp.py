@@ -19,6 +19,7 @@ class IncrementalCharacterizationExperiment:
         '''
 
         # Read a chronbench benchmark description file
+        benchmark_desc_file = os.path.abspath(benchmark_desc_file)
         benchmark_desc = self._parse_benchmark_desc_file(benchmark_desc_file)
         self.name = benchmark_desc.sections()[0]
 
@@ -38,14 +39,16 @@ class IncrementalCharacterizationExperiment:
             if deltaFPGA_args['deltaFPGA'] is None:
                 raise RuntimeError('Location of deltaFPGA entrypoint script is required!')
             if deltaFPGA_args['chronbench'] is None:
-                raise RuntimeError('Location of correspoinding Chronbench build directory is required!')
+                raise RuntimeError('Location of corresponding Chronbench build directory is required!')
         self.deltaFPGA_args = deltaFPGA_args
 
         # Assume the benchmark repo is located in the same directory as the desc
         self.gitroot = benchmark_desc_file.split('.')[0]
 
+        self.start_commit = start_commit
+        self.stop_commit = stop_commit
+
         # Set default names for project directories
-        self.expdir = self.name + '_' + self.tool + '_inc_exp'
         self.srcdir = 'src'
         self.tmin_file = 'tmin.txt'
         self.commitdirs = []
@@ -62,13 +65,16 @@ class IncrementalCharacterizationExperiment:
             self.fixed_timing = timing
             self.fmax_search_steps = 1
 
-        self.start_commit = start_commit
-        self.stop_commit = stop_commit
-
     def clean_experiment(self):
         '''
         Remove the directory structure for the incremental characterization experiment
         '''
+        # Figure out how many commits are available
+        self._collect_commits()
+
+        # Figure out the experimental range
+        self._set_start_stop()
+
         if not os.path.isdir(self.expdir):
             print("QUITTING "+self.expdir+" does not exist!")
             exit()
@@ -81,27 +87,7 @@ class IncrementalCharacterizationExperiment:
         '''
         self._initialize_experiment()
 
-        # The root commit is the oldes commit in the benchmark history
-        root_commit = len(self.commits)-1
-
-        # If start and stop commits were not specified run the experiment across
-        # the entire available design history.
-        if self.stop_commit is None:
-            self.stop_commit = 0
-        if self.start_commit is None:
-            self.start_commit = root_commit
-
-        # check validity of start and stop commits
-        if self.stop_commit > self.start_commit:
-            print("QUITTING: stop_commit should be younger than start_commit")
-            exit()
-        if self.stop_commit < 0:
-            print("QUITTING: stop_commit invalid")
-            exit()
-        if self.start_commit > root_commit:
-            print("QUITTING: start_commit invalid")
-            exit()
-
+        # Different tools require different setup in incremental mode
         if self.tool == 'vivado':
             tool_fn = self._run_vivado_implementation
             def compute_extra_args(cidx):
@@ -120,37 +106,37 @@ class IncrementalCharacterizationExperiment:
                     prev_commit = self.commitdirs[cidx+1]
                     return {'ref_prj': prev_commit}
         elif self.tool == 'deltaFPGA':
+            # deltaFPGA is more complicated since it operates over
+            # pre-synthesized DCPs
             tool_fn = self._run_deltaFPGA_implementation
+            self.base_compile_dir = os.path.abspath(self.deltaFPGA_args['chronbench'])
+            self.deltaFPGA_entrypoint = os.path.abspath(self.deltaFPGA_args['deltaFPGA'])
+            self.base_compiles = os.listdir(self.base_compile_dir)
             def compute_extra_args(cidx):
-                if cidx == self.start_commit:
-                    self.base_compile_dir = os.path.abspath(self.deltaFPGA_args['chronbench'])
-                    self.deltaFPGA_entrypoint = os.path.abspath(self.deltaFPGA_args['deltaFPGA'])
-                    self.base_compiles = os.listdir(self.base_compile_dir)
-                cb_dcp = os.path.join('autoxpr', 'autopnrxpr.dcp')
+                cb_dcp = os.path.join('autoxpr', 'autosynthxpr.dcp')
                 for bc in self.base_compiles:
                     bc_idx = int(bc.split('_')[0])
-                    if bc_idx == cidx+1:
-                        last_dcp = os.path.join(self.base_compile_dir,bc,cb_dcp)
                     if bc_idx == cidx:
                         next_dcp = os.path.join(self.base_compile_dir,bc,cb_dcp)
-                if cidx == root_commit:
-                    return {'last': None, 'next': next_dcp}
-                else:
+                inc_last_dcp = ''
+                if cidx != self.start_commit:
                     prev_commit = os.path.abspath(self.commitdirs[cidx+1])
                     run_name = os.path.basename(self.commitdirs[cidx+1])
                     inc_last_dcp = os.path.join(prev_commit,run_name+'.dcp')
-                    if os.path.isfile(inc_last_dcp):
-                        last_dcp = inc_last_dcp
-                        self._write_file(['incremental compile'], os.path.join(self.commitdirs[cidx+1], 'INCREMENTAL_COMPILE.txt'))
-                    else:
-                        self._write_file(['base compile'], os.path.join(self.commitdirs[cidx+1], 'BASE_COMPILE.txt'))
-                    return {'last': last_dcp , 'next': next_dcp}
+                if os.path.isfile(inc_last_dcp):
+                    last_dcp = inc_last_dcp
+                    self._write_file(['incremental compile'], os.path.join(self.commitdirs[cidx], 'INCREMENTAL_COMPILE.txt'))
+                else:
+                    last_dcp = None
+                    self._write_file(['base compile'], os.path.join(self.commitdirs[cidx], 'BASE_COMPILE.txt'))
+                return {'last': last_dcp , 'next': next_dcp}
 
+        # Run the experiment over the desired range
         for cidx in reversed(range(self.stop_commit, self.start_commit+1)):
             if os.path.isfile(os.path.join(self.commitdirs[cidx],self.tmin_file)):
                 print("Skipping commit "+str(cidx))
             else:
-                if cidx == root_commit:
+                if cidx == self.start_commit:
                     print("Building root commit")
                     self._fmax_search(cidx, tool_fn, compute_extra_args(cidx))
                 else:
@@ -169,12 +155,24 @@ class IncrementalCharacterizationExperiment:
         config.read(benchmark_desc_file)
         return config
 
+    def _collect_commits(self):
+        # Get a handle for the benchmark repository and collect commits
+        self.repo = git.Repo(self.gitroot)
+        self.commits = list(self.repo.iter_commits(self.branch_name))
+        print("Found "+str(len(self.commits))+" commits in "+self.name)
+
     def _initialize_experiment(self):
         '''
         Create an experiment directory if it does not already exist, and
         create projects for each commit in the benchmark if they do not already
         exist.
         '''
+        # Figure out how many commits are available
+        self._collect_commits()
+
+        # Figure out the experimental range
+        self._set_start_stop()
+
         # Create the experiment directory
         if not os.path.isdir(self.expdir):
             os.makedirs(self.expdir)
@@ -182,18 +180,14 @@ class IncrementalCharacterizationExperiment:
             print("Found existing "+self.expdir+" experiment directory")
             print("\tPerhaps you meant to run with `--clean`?")
 
-        # get a handle for the benchmark repository and collect commits
-        self.repo = git.Repo(self.gitroot)
-        self.commits = list(self.repo.iter_commits(self.branch_name))
-        print("Found "+str(len(self.commits))+" commits in "+self.name)
-
         # create names for each commit level project
         digits = math.ceil(math.log(len(self.commits), 10))
         digit_fmt = "{:0"+str(digits)+"d}"
 
+        # create commit directories for each commit in the experimental range
         new_commit_dirs = 0
         existing_commit_dirs = 0
-        for cidx in range(len(self.commits)):
+        for cidx in range(self.stop_commit, self.start_commit+1):
             commit_name = digit_fmt.format(cidx)
             self.commitdirs.append(os.path.join(self.expdir, self.branch_name+'_'+commit_name))
             this_commitdir = self.commitdirs[-1]
@@ -207,10 +201,51 @@ class IncrementalCharacterizationExperiment:
         print("Found "+str(existing_commit_dirs)+" existing commit directories")
         print("Initialized "+str(new_commit_dirs)+" new commit directories")
 
+    def _set_start_stop(self):
+        '''
+        Figure out the start and stop commits. If either start or stop are not
+        specified set them to the first and last commits respectively.
+        Ensure that the experimental range is valid, and set the name of the
+        experiment directory.
+        '''
+        # If start and stop commits were not specified run the experiment across
+        # the entire available design history.
+        if self.stop_commit is None:
+            self.stop_commit = 0
+        if self.start_commit is None:
+            self.start_commit = len(self.commits)-1
+
+        # Check validity of start and stop commits
+        if self.stop_commit > self.start_commit:
+            print("QUITTING: stop_commit should be younger than start_commit")
+            exit()
+        if self.stop_commit < 0:
+            print("QUITTING: stop_commit invalid")
+            exit()
+        if self.start_commit > len(self.commits)-1:
+            print("QUITTING: start_commit invalid")
+            exit()
+
+        # Determine the name of the experiment directory based on start/stop
+        postfix = '_'
+        if (self.start_commit is None) and (self.stop_commit is None):
+            postfix += "full"
+        elif (self.start_commit is not None) and (self.stop_commit is None):
+            postfix += str(self.start_commit) + "_stop"
+        elif (self.start_commit is None) and (self.stop_commit is not None):
+            postfix += "start_" + str(self.stop_commit)
+        else:
+            postfix += str(self.start_commit) + "_" + str(self.stop_commit)
+        
+        self.expdir = self.name + '_' + self.tool + postfix
+
     def _initialize_commit(self, cidx, commitdir):
         '''
         Initialize commitdir with the contents of self.commits[cidx]
         '''
+        # deltaFPGA operates over pre-synthesized DCPs, so doesn't need src files
+        if self.tool == 'deltaFPGA': return
+
         commit = self.commits[cidx]
 
         # checkout the commit of interest and get a file list
@@ -505,11 +540,6 @@ class IncrementalCharacterizationExperiment:
         last_dcp = extra_args['last']
         next_dcp = extra_args['next']
 
-        # special case: the root commit is always a Base Compile, which we
-        # assume was successful
-        if last_dcp is None:
-            return True
-
         constraint_name = 'df.sdc'
         build_script_name = 'df_build.tcl'
         this_commitdir = self.commitdirs[commit_idx]
@@ -517,6 +547,10 @@ class IncrementalCharacterizationExperiment:
 
         run_name = os.path.basename(this_commitdir)
         log_name = run_name+'.log'
+        dcp_name = run_name+'.dcp'
+        vivado_input_dcp = dcp_name
+        if last_dcp is None:
+            vivado_input_dcp = next_dcp
 
         self._write_clock_constraint(this_constraint, period_ns)
 
@@ -527,15 +561,12 @@ class IncrementalCharacterizationExperiment:
                 'source '+constraint_name
 
         script = [
-            'open_checkpoint {'+run_name+'.dcp}',
+            'open_checkpoint {'+vivado_input_dcp+'}',
             'catch {',
-            'place_design',
-            #'reset_timing', #
             timing_constraint,
+            'place_design',
             'route_design',
-            #timing_constraint, #
-            'write_checkpoint -force {'+run_name+'.dcp}',
-            # reporting
+            'write_checkpoint -force {'+dcp_name+'}',
             'report_timing -file timing.log',
             'report_utilization -file util.log',
             '}',
@@ -545,15 +576,16 @@ class IncrementalCharacterizationExperiment:
 
         start = time.time()
         # run DeltaFPGA
-        inc_next_dcp = os.path.join(os.path.abspath(this_commitdir), run_name+'.dcp')
-        subprocess.run(['./gradlew',
-                        ':run',
-                        '--args='+last_dcp+' '+next_dcp+' '+inc_next_dcp],
-                       cwd=self.deltaFPGA_entrypoint,
-                       capture_output=True)
+        if last_dcp is not None:
+            inc_next_dcp = os.path.join(os.path.abspath(this_commitdir), dcp_name)
+            subprocess.run(['./gradlew',
+                            ':run',
+                            '--args='+last_dcp+' '+next_dcp+' '+inc_next_dcp],
+                           cwd=self.deltaFPGA_entrypoint,
+                           capture_output=True)
 
         # run Vivado
-        subprocess.run(['vivado', '-nojournal', '-log', run_name+'.log',  '-mode',
+        subprocess.run(['vivado', '-nojournal', '-log', log_name,  '-mode',
                         'tcl', '-source', build_script_name],
                         cwd=this_commitdir, capture_output=True)
         stop = time.time()
