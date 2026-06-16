@@ -547,7 +547,9 @@ class IncrementalCharacterizationExperiment:
 
         run_name = os.path.basename(this_commitdir)
         log_name = run_name+'.log'
+        df_log = run_name+'_df.log'
         dcp_name = run_name+'.dcp'
+        edf_name = run_name+'.edf'
         vivado_input_dcp = dcp_name
         if last_dcp is None:
             vivado_input_dcp = next_dcp
@@ -567,6 +569,7 @@ class IncrementalCharacterizationExperiment:
             'place_design',
             'route_design',
             'write_checkpoint -force {'+dcp_name+'}',
+            'write_edif {'+edf_name+'}',
             'report_timing -file timing.log',
             'report_utilization -file util.log',
             '}',
@@ -578,11 +581,22 @@ class IncrementalCharacterizationExperiment:
         # run DeltaFPGA
         if last_dcp is not None:
             inc_next_dcp = os.path.join(os.path.abspath(this_commitdir), dcp_name)
-            subprocess.run(['./gradlew',
-                            ':run',
-                            '--args='+last_dcp+' '+next_dcp+' '+inc_next_dcp],
-                           cwd=self.deltaFPGA_entrypoint,
-                           capture_output=True)
+            df_log = os.path.join(os.path.abspath(this_commitdir),df_log)
+            with open(df_log, 'a') as incremental_log:
+                fail_count = 4
+                back_off = 1
+                while fail_count > 0:
+                    ret = subprocess.run(['./gradlew',
+                                    ':run',
+                                    '--args='+last_dcp+' '+next_dcp+' '+inc_next_dcp],
+                                   cwd=self.deltaFPGA_entrypoint,
+                                   stderr=subprocess.STDOUT, stdout=incremental_log)
+                    if ret.returncode == 0: break
+                    else:
+                        time.sleep(back_off)
+                        fail_count -= 1
+                        back_off *= 2
+                        self._write_file([str(fail_count)], os.path.join(this_commitdir, 'gradle_deadlock.txt'))
 
         # run Vivado
         subprocess.run(['vivado', '-nojournal', '-log', log_name,  '-mode',
