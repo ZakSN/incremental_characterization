@@ -12,7 +12,7 @@ class IncrementalCharacterizationExperiment:
 
     def __init__(self, benchmark_desc_file, tool, timing,
                  start_commit=None, stop_commit=None,
-                 deltaFPGA_args={'deltaFPGA' : None, 'chronbench' : None}):
+                 deltaFPGA_args={'deltaFPGA' : None, 'chronbench' : None, 'no_base' : False}):
         '''
         Initialize an incremental characterization experiment based on the
         benchmark repository located at gitroot.
@@ -129,6 +129,7 @@ class IncrementalCharacterizationExperiment:
                 else:
                     last_dcp = None
                     self._write_file(['base compile'], os.path.join(self.commitdirs[cidx], 'BASE_COMPILE.txt'))
+                    if cidx != self.start_commit and self.deltaFPGA_args['no_base']: exit()
                 return {'last': last_dcp , 'next': next_dcp}
 
         # Run the experiment over the desired range
@@ -563,8 +564,8 @@ class IncrementalCharacterizationExperiment:
                 'source '+constraint_name
 
         script = [
-            'open_checkpoint {'+vivado_input_dcp+'}',
             'catch {',
+            'open_checkpoint {'+vivado_input_dcp+'}',
             timing_constraint,
             'place_design',
             'route_design',
@@ -632,6 +633,7 @@ def main():
     parser.add_argument('--fixed_timing', type=float, default=None, help='Timing constraint to use for each version, instead of Fmax search')
     parser.add_argument('--deltaFPGA', type=str, default=None, help='Required for deltaFPGA, ignored for all else. Location of deltaFPGA entrypoint script')
     parser.add_argument('--chronbench', type=str, default=None, help='Required for deltaFPGA, ignored for all else. Location of corresponding Chronbench characterization run')
+    parser.add_argument('--no_base_compile', action='store_true', help='When using deltaFPGA, if an incremental compile fails exit instead of running a base compile')
 
     args = parser.parse_args()
 
@@ -647,7 +649,9 @@ def main():
     ice = IncrementalCharacterizationExperiment(
         args.benchmark, args.tool, timing, args.start_commit,
         args.stop_commit,
-        {'deltaFPGA' : args.deltaFPGA, 'chronbench' : args.chronbench})
+        {'deltaFPGA' : args.deltaFPGA,
+         'chronbench' : args.chronbench,
+         'no_base' : args.no_base_compile})
 
     if args.clean:
         ice.clean_experiment()
