@@ -10,7 +10,8 @@ import distutils
 
 class IncrementalCharacterizationExperiment:
 
-    def __init__(self, benchmark_desc_file, tool, timing,
+    def __init__(self, benchmark_desc_file, tool,
+                 fmax_search=True, no_timing=False, fixed_timing=None,
                  start_commit=None, stop_commit=None,
                  deltaFPGA_args={'deltaFPGA' : None, 'chronbench' : None, 'no_base' : False}):
         '''
@@ -56,13 +57,14 @@ class IncrementalCharacterizationExperiment:
         # Experimental settings
         self.no_timing = False
         self.fixed_timing = None
-        if timing == None:
+
+        if fmax_search:
             self.fmax_search_steps = 6
-        elif timing == True:
+        elif no_timing:
             self.no_timing = True
             self.fmax_search_steps = 1
-        else:
-            self.fixed_timing = timing
+        elif fixed_timing is not None:
+            self.fixed_timing = fixed_timing
             self.fmax_search_steps = 1
 
     def clean_experiment(self):
@@ -580,8 +582,8 @@ class IncrementalCharacterizationExperiment:
 
         start = time.time()
         # run DeltaFPGA
+        inc_next_dcp = os.path.join(os.path.abspath(this_commitdir), dcp_name)
         if last_dcp is not None:
-            inc_next_dcp = os.path.join(os.path.abspath(this_commitdir), dcp_name)
             df_log = os.path.join(os.path.abspath(this_commitdir),df_log)
             with open(df_log, 'a') as incremental_log:
                 fail_count = 4
@@ -614,6 +616,12 @@ class IncrementalCharacterizationExperiment:
         success = self._check_log(os.path.join(this_commitdir, 'timing.log'), 'Slack (MET) :')
         if self.fixed_timing is not None:
             self._write_file(["Met timing: "+str(success)], os.path.join(this_commitdir, 'timing_result.txt'))
+            if not success:
+                # fixed_timing, and timing was not met: rename this DCP to trigger a base compile
+                if os.path.exists(inc_next_dcp):
+                    os.rename(inc_next_dcp,
+                              os.path.join(os.path.abspath(this_commitdir),
+                                           "failed_timing_"+dcp_name))
             return True
 
         return success
@@ -638,7 +646,7 @@ def main():
     args = parser.parse_args()
 
     if (args.no_timing == True) and (args.fixed_timing is not None):
-        print("Incompatible arguments: --no_timing and --fixed_timing="+args.fixed_timing)
+        print("Incompatible arguments: --no_timing and --fixed_timing="+str(args.fixed_timing))
         exit()
     timing = None
     if args.no_timing:
@@ -646,8 +654,20 @@ def main():
     if args.fixed_timing is not None:
         timing = args.fixed_timing
 
+    fmax_search  = True
+    no_timing    = False
+    fixed_timing = None
+    if args.no_timing:
+        fmax_search  = False
+        no_timing    = True
+        fixed_timing = None
+    elif args.fixed_timing is not None:
+        fmax_search  = False
+        no_timing    = False
+        fixed_timing = args.fixed_timing
+
     ice = IncrementalCharacterizationExperiment(
-        args.benchmark, args.tool, timing, args.start_commit,
+        args.benchmark, args.tool, fmax_search, no_timing, fixed_timing, args.start_commit,
         args.stop_commit,
         {'deltaFPGA' : args.deltaFPGA,
          'chronbench' : args.chronbench,
